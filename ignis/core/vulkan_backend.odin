@@ -10,9 +10,14 @@ import "vendor:glfw"
 import vk "vendor:vulkan"
 
 // TODO(Mitchell):
-// Vulkan debug logging (callback)
 // Caching valid physical devices 
 
+VK_Queue_Family_Data :: enum {
+	Family,
+	Requested,
+	Capacity
+}
+	
 VK_Instance :: struct {
 	handle:     vk.Instance,
 	extensions: []cstring,
@@ -62,7 +67,6 @@ VK_Swapchain :: struct {
 	images:          []VK_Image,
 	attributes:      VK_Swapchain_Attributes,
 	support_details: VK_Swapchain_Support_Details,
-	on_recreation:   [dynamic]proc(vk.Extent2D),
 
 	initialised: bool,
 }
@@ -73,7 +77,7 @@ VK_Application_Info :: struct {
 	app_version: u32,
 	extensions:  []cstring,
 	layers:      []cstring,
-	features:    ^vk.ValidationFeaturesEXT,
+	features:    rawptr,
 }
 
 VK_Context :: struct {
@@ -102,7 +106,6 @@ vk_init :: proc(
 
 	log.info("Vulkan: Initialising")
 	
-	// load process addresses
 	vk.load_proc_addresses(rawptr(glfw.GetInstanceProcAddress))
 
 	log.info("Vulkan: Successfully loaded instance proc address")
@@ -119,7 +122,7 @@ vk_init :: proc(
 
 	// NOTE(Mitchell):
 	// Glfw has its own required extensions that must be appended to user requested extensions.
-	// It may be worth checking for overlapping extension requests but for now I won't. 
+	// It may be worth checking for overlapping extension requests but for now I won't.
 	glfw_extensions := glfw.GetRequiredInstanceExtensions()
 	extensions := make([]cstring, len(glfw_extensions) + len(app_info.extensions))
 	copy(extensions[:len(glfw_extensions)], glfw_extensions)
@@ -165,13 +168,13 @@ vk_init :: proc(
 	vk_fatal(vk.EnumeratePhysicalDevices(vk_context.instance.handle, &physical_device_count, raw_data(physical_devices)))		
 
 	best_rating: u32
-	best_queue_indices: [VK_Queue_Type][2]u32
+	best_queue_indices: [VK_Queue_Type][VK_Queue_Family_Data]u32
 	for physical_device in physical_devices {
 		valid, rating, queue_indices := vk_physical_device_rate(physical_device, &device_attributes)
 		if valid && rating > best_rating {
 			best_rating = rating
 			vk_context.device.physical = physical_device
-			for index_count, queue in queue_indices do vk_context.device.queue_indices[queue] = index_count[0]
+			for index_count, queue in queue_indices do vk_context.device.queue_indices[queue] = index_count[.Family]
 			best_queue_indices = queue_indices
 			continue
 		}
@@ -187,9 +190,9 @@ vk_init :: proc(
 
 	// NOTE(Mitchell): We need to know the set of queue indices and the count of queues for each of those indices
 	for index_count, queue in best_queue_indices {
-		if index_count[0] not_in unique_queue_indices {
-			unique_queue_indices[index_count[0]] = index_count[1]
-			if index_count[1] > largest_count do largest_count = index_count[1]
+		if index_count[.Family] not_in unique_queue_indices {
+			unique_queue_indices[index_count[.Family]] = index_count[.Requested]
+			if index_count[.Requested] > largest_count do largest_count = index_count[.Requested]
 		}
 	}
 
@@ -225,8 +228,8 @@ vk_init :: proc(
 	vk_fatal(vk.CreateDevice(vk_context.device.physical, &device_create_info, nil, &vk_context.device.logical))
 	
 	for index_count, queue in best_queue_indices {
-		count := &unique_queue_indices[index_count[0]]
-		vk.GetDeviceQueue(vk_context.device.logical, index_count[0], count^-1, &vk_context.device.queues[queue])
+		count := &unique_queue_indices[index_count[.Family]]
+		vk.GetDeviceQueue(vk_context.device.logical, index_count[.Family], count^-1, &vk_context.device.queues[queue])
 		if count^ > 1 do count^ -= 1
 	}
 
@@ -261,7 +264,6 @@ vk_destroy :: proc() {
 	delete(vk_context.swapchain.images)
 	delete(vk_context.swapchain.support_details.formats)
 	delete(vk_context.swapchain.support_details.present_modes)
-	delete(vk_context.swapchain.on_recreation)
 
 	// device
 	vk_context.device.initialised = false
@@ -282,7 +284,7 @@ vk_physical_device_rate :: proc(
 ) -> (
 	valid:             bool,
 	rating:            u32,
-	queue_indices:     [VK_Queue_Type][2]u32,
+	queue_indices:     [VK_Queue_Type][VK_Queue_Family_Data]u32,
 ) {
 	context.allocator = allocator
 	ensure(device_attributes != nil)
@@ -332,9 +334,13 @@ vk_physical_device_rate :: proc(
 		if !supports_present_mode do return false, 0, {}
 	}	
 	
-	// queues
-	present_index: [2]u32 = {max(u32), max(u32)}
-	queues_found := make(map[vk.QueueFlag][3]u32)
+	// queues	
+	present_queue: [VK_Queue_Family_Data]u32 = {
+		.Family    = max(u32),
+		.Requested = max(u32),
+		.Capacity  = max(u32),
+	}
+	queues_found := make(map[vk.QueueFlag][VK_Queue_Family_Data]u32)
 	defer delete(queues_found)	
 	
 	queue_family_count: u32
@@ -347,84 +353,99 @@ vk_physical_device_rate :: proc(
 
 	vk.GetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, raw_data(queue_families))
 
-	// find a graphics queue
 	for family, i in queue_families {
 		can_present: b32
 		vk_warn(vk.GetPhysicalDeviceSurfaceSupportKHR(physical_device, u32(i), vk_context.surface.handle, &can_present))
 		
 		if .GRAPHICS in family.queueFlags && can_present {
-			queues_found[.GRAPHICS] = {u32(i), 1, family.queueCount}
-			present_index = {u32(i), 1}
+			queues_found[.GRAPHICS] = {
+				.Family    = u32(i),
+				.Requested = 1,
+				.Capacity  = family.queueCount
+			}
+			present_queue = {
+				.Family    = u32(i),
+				.Requested = 1,
+				.Capacity  = family.queueCount
+			}
 			break
 		} 
 	}
 	if .GRAPHICS not_in queues_found do return false, 0, {}
 
-	// attempt to find dedicated transfer queue or a queue family that supports transfers and is not in use by graphics
 	for family, i in queue_families {
 		if .TRANSFER in family.queueFlags && .GRAPHICS not_in family.queueFlags && .COMPUTE not_in family.queueFlags {
-			queues_found[.TRANSFER] = {u32(i), 1, family.queueCount}
+			queues_found[.TRANSFER] = {
+				.Family    = u32(i),
+				.Requested = 1,
+				.Capacity  = family.queueCount
+			}
 			break
-		} else if .TRANSFER in family.queueFlags && queues_found[.GRAPHICS][0] != u32(i) {
-			queues_found[.TRANSFER] = {u32(i), 1, family.queueCount}
+		} else if .TRANSFER in family.queueFlags && queues_found[.GRAPHICS][.Family] != u32(i) {
+			queues_found[.TRANSFER] = {
+				.Family    = u32(i),
+				.Requested = 1,
+				.Capacity  = family.queueCount
+			}
 		}
 	}
 
-	// only family left to check is what the graphics queue is using
 	if .TRANSFER not_in queues_found {
 		family_info := &queues_found[.GRAPHICS]
 		
-		if .TRANSFER in queue_families[family_info[0]].queueFlags {
-			// if family supports more than one queue, increment queue count
-			if family_info[1] < family_info[2] do family_info[1] += 1
+		if .TRANSFER in queue_families[family_info[.Family]].queueFlags {
+			if family_info[.Requested] < family_info[.Capacity] do family_info[.Requested] += 1
 			queues_found[.TRANSFER] = family_info^
 		} else {
 			return false, 0, {}
 		}
 	}
 
-	// attempt to find dedicated compute queue or queue family that is not in use by transfer
 	decrement_graphics_queue_count: bool
 	for family, i in queue_families {
 		if .COMPUTE in family.queueFlags && .GRAPHICS not_in family.queueFlags && .TRANSFER not_in family.queueFlags {
-			queues_found[.COMPUTE] = {u32(i), 1, family.queueCount}
+			queues_found[.COMPUTE] = {
+				.Family    = u32(i),
+				.Requested = 1,
+				.Capacity  = family.queueCount
+			}
 			break
-		} else if .COMPUTE in family.queueFlags && queues_found[.TRANSFER][0] != u32(i) {
+		} else if .COMPUTE in family.queueFlags && queues_found[.TRANSFER][.Family] != u32(i) {
 			graphics_family_info := &queues_found[.GRAPHICS]
 
-			// if graphics is using this family
-			if graphics_family_info[0] == u32(i) {
-				// try to create separate compute queue in family
-				if graphics_family_info[2] > 1 do graphics_family_info[1] += 1
+			if graphics_family_info[.Family] == u32(i) {
+				if graphics_family_info[.Capacity] > 1 do graphics_family_info[.Requested] += 1
 				queues_found[.COMPUTE] = graphics_family_info^
 				decrement_graphics_queue_count = true
 			} else {
 				if decrement_graphics_queue_count {
-					graphics_family_info[1] -= 1
+					graphics_family_info[.Requested] -= 1
 					decrement_graphics_queue_count = false
 				}
-				queues_found[.COMPUTE] = {u32(i), 1, family.queueCount}
+				queues_found[.COMPUTE] = {
+					.Family    = u32(i),
+					.Requested = 1,
+					.Capacity  = family.queueCount
+				}
 			}
 		}
 	}
 
-	// only family left to check is what the trasnfer queue is using
 	if .COMPUTE not_in queues_found {
 		family_info := &queues_found[.TRANSFER]
 
-		if .COMPUTE in queue_families[family_info[0]].queueFlags {
-			// try to create separate compute queue in family
-			if family_info[1] < family_info[2] do family_info[1] += 1
+		if .COMPUTE in queue_families[family_info[.Family]].queueFlags {
+			if family_info[.Requested] < family_info[.Capacity] do family_info[.Requested] += 1
 			queues_found[.COMPUTE] = family_info^
 		} else {
 			return false, 0, {}
 		}
 	}
 
-	queue_indices[.Graphics] = queues_found[.GRAPHICS].xy
-	queue_indices[.Compute]  = queues_found[.COMPUTE].xy
-	queue_indices[.Transfer] = queues_found[.TRANSFER].xy
-	queue_indices[.Present]  = present_index
+	queue_indices[.Graphics] = queues_found[.GRAPHICS]
+	queue_indices[.Compute]  = queues_found[.COMPUTE]
+	queue_indices[.Transfer] = queues_found[.TRANSFER]
+	queue_indices[.Present]  = present_queue
 
 	// rating
 	device_properties: vk.PhysicalDeviceProperties
@@ -433,13 +454,16 @@ vk_physical_device_rate :: proc(
 	device_features: vk.PhysicalDeviceFeatures
 	vk.GetPhysicalDeviceFeatures(physical_device, &device_features)
 
-	// NOTE(Mitchell): We may want to play around with these numbers
-	rating += device_properties.limits.maxImageDimension2D        / 1e4
-	rating += device_properties.limits.maxUniformBufferRange      / 1e6
-	rating += device_properties.limits.maxStorageBufferRange      / 1e9
-	rating += device_properties.limits.maxComputeSharedMemorySize / 1e9
+	Avg_Scrn_Width :: (1920 + 1080) / 2
+	Make_Mb        :: 1e6
+	Make_Gb        :: 1e9
+
+	rating += device_properties.limits.maxImageDimension2D        / Avg_Scrn_Width
+	rating += device_properties.limits.maxUniformBufferRange      / Make_Mb
+	rating += device_properties.limits.maxStorageBufferRange      / Make_Gb
+	rating += device_properties.limits.maxComputeSharedMemorySize / Make_Gb
 	
-	if device_properties.deviceType == .DISCRETE_GPU do rating += 1e1
+	if device_properties.deviceType == .DISCRETE_GPU do rating += 10
 	if device_features.samplerAnisotropy  do rating += 1
 	if device_features.geometryShader     do rating += 1
 	if device_features.tessellationShader do rating += 1
@@ -449,8 +473,9 @@ vk_physical_device_rate :: proc(
 	return true, rating, queue_indices
 }
 
-// NOTE(Mitchell): Uses vk_context.device.physical and vk_context.surface.handle to retrieve information
-vk_swapchain_query_support :: proc(
+vk_swapchain_query_support_details :: proc(
+	surface:         vk.SurfaceKHR,
+	physical_device: vk.PhysicalDevice,
 	allocator := context.allocator
 ) -> (
 	support_details: VK_Swapchain_Support_Details
@@ -458,28 +483,27 @@ vk_swapchain_query_support :: proc(
 	context.allocator = allocator
 	ensure(vk_context.device.initialised)
 
-	vk_fatal(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(vk_context.device.physical, vk_context.surface.handle, &support_details.capabilities))
+	vk_fatal(vk.GetPhysicalDeviceSurfaceCapabilitiesKHR(physical_device, surface, &support_details.capabilities))
 
 	format_count: u32
-	vk_fatal(vk.GetPhysicalDeviceSurfaceFormatsKHR(vk_context.device.physical, vk_context.surface.handle, &format_count, nil))
+	vk_fatal(vk.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, nil))
 	ensure(format_count != 0)
 
 	support_details.formats = make([]vk.SurfaceFormatKHR, format_count)
-	vk_fatal(vk.GetPhysicalDeviceSurfaceFormatsKHR(vk_context.device.physical, vk_context.surface.handle, &format_count, raw_data(support_details.formats)))
+	vk_fatal(vk.GetPhysicalDeviceSurfaceFormatsKHR(physical_device, surface, &format_count, raw_data(support_details.formats)))
 
 	present_mode_count: u32
-	vk_fatal(vk.GetPhysicalDeviceSurfacePresentModesKHR(vk_context.device.physical, vk_context.surface.handle, &present_mode_count, nil))
+	vk_fatal(vk.GetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, nil))
 	ensure(present_mode_count != 0)
 
 	support_details.present_modes = make([]vk.PresentModeKHR, present_mode_count)
-	vk_fatal(vk.GetPhysicalDeviceSurfacePresentModesKHR(vk_context.device.physical, vk_context.surface.handle, &present_mode_count, raw_data(support_details.present_modes)))
+	vk_fatal(vk.GetPhysicalDeviceSurfacePresentModesKHR(physical_device, surface, &present_mode_count, raw_data(support_details.present_modes)))
 
 	support_details.initialised = true
 
 	return support_details
 }
 
-// NOTE(Mitchell): This is a separate function because you need to recreate the swapchain on resize
 vk_swapchain_create :: proc(
 	swapchain_attributes: ^VK_Swapchain_Attributes,
 	allocator := context.allocator
@@ -502,7 +526,7 @@ vk_swapchain_create :: proc(
 		delete(support_details.present_modes)
 	}
 	
-	support_details^ = vk_swapchain_query_support()
+	support_details^ = vk_swapchain_query_support_details(vk_context.surface.handle, vk_context.device.physical)
 
 	if support_details.capabilities.currentExtent.width != max(u32) {
 		swapchain_create_info.imageExtent = support_details.capabilities.currentExtent
@@ -611,8 +635,6 @@ vk_swapchain_create :: proc(
 
 		log.info("Vulkan: Successfully created swapchain image-view", i+1)
 	}
-
-	if swapchain.on_recreation == nil do swapchain.on_recreation = make([dynamic]proc(vk.Extent2D))
 	
 	vk_context.swapchain.initialised = true
 }
@@ -647,8 +669,6 @@ vk_swapchain_recreate :: proc(
 	vk.DeviceWaitIdle(vk_context.device.logical)
 	vk_swapchain_destroy()
 	vk_swapchain_create(&attributes)
-
-	for on_recreation in vk_context.swapchain.on_recreation do on_recreation(attributes.extent)
 }
 
 vk_memory_type_find_index :: proc(
@@ -672,13 +692,13 @@ vk_memory_type_find_index :: proc(
 
 vk_fatal :: #force_inline proc(result: vk.Result, msg: cstring = "", location := #caller_location) {
 	if result != .SUCCESS {
-		log.fatalf("%s Vulkan - Fatal %v: %s", location, result, msg)
+		log.fatalf("%s Vulkan - Fatal %v: %s", result, msg, location = location)
 		os.exit(-1)
 	}
 }
 
 vk_warn :: #force_inline proc(result: vk.Result, msg: cstring = "", location := #caller_location) {
 	if result != .SUCCESS {
-		log.warnf("%s Vulkan - Warn %v: %s", location, result, msg)
+		log.warnf("%s Vulkan - Warn %v: %s", result, msg, location = location)
 	}
 } 
