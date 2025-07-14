@@ -1,14 +1,26 @@
 package core
 
+import "core:log"
+
 import "vendor:glfw"
 import vk "vendor:vulkan"
+
+Monitor_Type :: enum {
+	Primary,
+	Secondary,
+}
+
+Monitor_Details :: struct {
+	width:        i32,
+	height:       i32,
+	refresh_rate: i32,
+	type:         Monitor_Type,
+}
 
 window_create :: proc(
 	width:       i32,
 	height:      i32,
 	title:       cstring,
-	app_name:    cstring = "",
-	app_version: u32 = 0,
 	allocator := context.allocator,
 ) {
 	context.allocator = allocator
@@ -32,13 +44,16 @@ window_create :: proc(
 	input_init()
 
 	layers: []cstring
-	when !RELEASE do layers = {"VK_LAYER_KHRONOS_validation"}
+	when VALIDATION_LAYERS do layers = {"VK_LAYER_KHRONOS_validation"}
 
 	app_info: VK_Application_Info = {
 		api_version = vk.API_VERSION_1_3,
-		app_name    = app_name,
-		app_version = app_version,
-		extensions  = {},
+		extensions  = {
+			"VK_KHR_external_memory_capabilities",
+			"VK_KHR_external_fence_capabilities",
+			"VK_KHR_external_semaphore_capabilities",
+			"VK_KHR_get_physical_device_properties2",
+		},
 		layers      = layers,
 		features    = nil,
 	}
@@ -51,7 +66,17 @@ window_create :: proc(
 	device_attribtes: VK_Device_Attributes = {
 		features      = &dynamic_rendering_feature,
 		present_modes = {.FIFO},
-		extensions    = {vk.KHR_SWAPCHAIN_EXTENSION_NAME},
+		extensions    = {
+			vk.KHR_SWAPCHAIN_EXTENSION_NAME,
+			"VK_KHR_external_memory",
+			"VK_KHR_external_memory_win32",
+			"VK_KHR_external_fence",
+			"VK_KHR_external_fence_win32",
+			"VK_KHR_external_semaphore",
+			"VK_KHR_external_semaphore_win32",
+			"VK_KHR_get_memory_requirements2",
+			"VK_KHR_dedicated_allocation",
+		}
 	}
 
 	swapchain_attributes: VK_Swapchain_Attributes = {
@@ -139,9 +164,60 @@ window_wait_events :: proc() {
 	glfw.WaitEvents()
 }
 
+window_go_fullscreen :: proc() {
+	ensure(glfw_context.initialised)
+
+	monitor := glfw.GetPrimaryMonitor()
+	video_mode := glfw.GetVideoMode(monitor)
+	
+	glfw.SetWindowMonitor(
+		glfw_context.handle,
+		monitor,
+		0, 0,
+		video_mode.width, video_mode.height,
+		video_mode.refresh_rate
+	)
+}
+
+window_go_windowed :: proc(
+	width:  i32,
+	height: i32
+) {
+	ensure(glfw_context.initialised)
+
+	video_mode := glfw.GetVideoMode(glfw.GetPrimaryMonitor())
+	x: i32 = i32(f32(video_mode.width) / 2 - f32(width) / 2)
+	y: i32 = i32(f32(video_mode.height) / 2 - f32(height) / 2)
+
+	glfw.SetWindowMonitor(
+		glfw_context.handle,
+		nil,
+		x, y,
+		width, height,
+		0
+	)
+}
+
+window_get_primary_monitor_details :: proc() -> (
+	monitor_details: Monitor_Details
+) {
+	ensure(glfw_context.initialised)
+
+	primary_monitor := glfw.GetPrimaryMonitor()	
+	video_mode := glfw.GetVideoMode(primary_monitor)
+	
+	monitor_details = {
+		width        = video_mode.width,
+		height       = video_mode.height,
+		refresh_rate = video_mode.refresh_rate,
+		type         = .Primary
+	}
+
+	return monitor_details
+}
+
 window_get_handle :: proc() -> (
 	handle: glfw.WindowHandle
 ) {
 	return glfw_context.handle
 }
-
