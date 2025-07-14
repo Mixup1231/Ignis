@@ -1,5 +1,6 @@
 package core
 
+import "core:os"
 import "core:log"
 
 import "vendor:glfw"
@@ -10,6 +11,14 @@ Monitor_Type :: enum {
 	Secondary,
 }
 
+Window_Property_Type :: enum {
+	Resizable   = glfw.RESIZABLE,
+	Visible     = glfw.VISIBLE,
+	Decorated   = glfw.DECORATED,
+	Transparent = glfw.TRANSPARENT_FRAMEBUFFER,
+	Floating    = glfw.FLOATING,
+}
+
 Monitor_Details :: struct {
 	width:        i32,
 	height:       i32,
@@ -17,10 +26,20 @@ Monitor_Details :: struct {
 	type:         Monitor_Type,
 }
 
-window_create :: proc(
-	width:       i32,
-	height:      i32,
-	title:       cstring,
+Window_Property :: struct {
+	property_type: Window_Property_Type,
+	enabled:       bool
+}
+
+window_create :: proc{
+	window_create_default,
+	window_create_extended,
+}
+
+window_create_default :: proc(
+	width:  i32,
+	height: i32,
+	title:  cstring,
 	allocator := context.allocator,
 ) {
 	context.allocator = allocator
@@ -44,43 +63,29 @@ window_create :: proc(
 	input_init()
 
 	layers: []cstring
-	when VALIDATION_LAYERS do layers = {"VK_LAYER_KHRONOS_validation"}
+	when !RELEASE do layers = {"VK_LAYER_KHRONOS_validation"}
 
 	app_info: VK_Application_Info = {
 		api_version = vk.API_VERSION_1_3,
-		extensions  = {
-			"VK_KHR_external_memory_capabilities",
-			"VK_KHR_external_fence_capabilities",
-			"VK_KHR_external_semaphore_capabilities",
-			"VK_KHR_get_physical_device_properties2",
-		},
+		extensions  = {},
 		layers      = layers,
-		features    = nil,
 	}
 
-	dynamic_rendering_feature: vk.PhysicalDeviceDynamicRenderingFeaturesKHR = {
-		sType            = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
-		dynamicRendering = true,
-	}
+	// dynamic_rendering_feature: vk.PhysicalDeviceDynamicRenderingFeaturesKHR = {
+	// 	sType            = .PHYSICAL_DEVICE_DYNAMIC_RENDERING_FEATURES,
+	// 	dynamicRendering = true,
+	// }
 
-	device_attribtes: VK_Device_Attributes = {
-		features      = &dynamic_rendering_feature,
+	device_attributes: VK_Device_Attributes = {
+		// features      = &dynamic_rendering_feature,
 		present_modes = {.FIFO},
 		extensions    = {
 			vk.KHR_SWAPCHAIN_EXTENSION_NAME,
-			"VK_KHR_external_memory",
-			"VK_KHR_external_memory_win32",
-			"VK_KHR_external_fence",
-			"VK_KHR_external_fence_win32",
-			"VK_KHR_external_semaphore",
-			"VK_KHR_external_semaphore_win32",
-			"VK_KHR_get_memory_requirements2",
-			"VK_KHR_dedicated_allocation",
 		}
 	}
 
 	swapchain_attributes: VK_Swapchain_Attributes = {
-		present_mode = .FIFO,
+		present_mode = .MAILBOX,
 		extent = {
 			width  = u32(width),
 			height = u32(height)
@@ -95,7 +100,82 @@ window_create :: proc(
 		},
 	}
 
-	vk_init(app_info, device_attribtes, swapchain_attributes)
+	vk_init(app_info, device_attributes, swapchain_attributes)
+}
+
+window_create_extended :: proc(
+	width:               i32,
+	height:              i32,
+	title:               cstring,
+	instance_layers:     []cstring         = {},
+	instance_extensions: []cstring         = {},
+	instance_features:   rawptr            = nil,
+	device_extensions:   []cstring         = {vk.KHR_SWAPCHAIN_EXTENSION_NAME},
+	device_features:     rawptr            = nil,
+	window_properties:   []Window_Property = {},
+	allocator := context.allocator
+) {
+	context.allocator = allocator
+	ensure(!glfw_context.initialised)
+	ensure(bool(glfw.Init()))
+
+	glfw.WindowHint(glfw.CLIENT_API, glfw.NO_API)
+	for property in window_properties {
+		glfw.WindowHint(i32(property.property_type), i32(property.enabled))
+	}
+
+	glfw_context = {
+		handle      = glfw.CreateWindow(width, height, title, nil, nil),
+		width       = width,
+		height      = height,
+		title       = title,
+		initialised = true
+	}
+	ensure(glfw_context.handle != nil)
+
+	glfw.SetWindowSizeCallback(glfw_context.handle, window_on_resize)
+
+	input_init()
+
+	app_info: VK_Application_Info = {
+		api_version = vk.API_VERSION_1_3,
+		extensions  = instance_extensions,
+		layers      = instance_layers,
+		features    = instance_features,
+	}
+
+	found_swapchain: bool
+	for extension in device_extensions {
+		if extension == vk.KHR_SWAPCHAIN_EXTENSION_NAME do found_swapchain = true
+	}
+	if !found_swapchain {
+		log.fatal("Window - Device extensions: Device extensions must contain", vk.KHR_SWAPCHAIN_EXTENSION_NAME)
+		os.exit(-1)
+	}
+
+	device_attributes: VK_Device_Attributes = {
+		features      = device_features,
+		extensions    = device_extensions,
+		present_modes = {.FIFO},
+	}
+
+	swapchain_attributes: VK_Swapchain_Attributes = {
+		present_mode = .MAILBOX,
+		extent = {
+			width  = u32(width),
+			height = u32(height)
+		},
+		format = {
+			format     = .R8G8B8A8_SRGB,
+			colorSpace = .SRGB_NONLINEAR
+		},
+		image_usage = {
+			.COLOR_ATTACHMENT,
+			.TRANSFER_DST
+		},
+	}
+
+	vk_init(app_info, device_attributes, swapchain_attributes)
 }
 
 window_destroy :: proc() {
@@ -214,10 +294,4 @@ window_get_primary_monitor_details :: proc() -> (
 	}
 
 	return monitor_details
-}
-
-window_get_handle :: proc() -> (
-	handle: glfw.WindowHandle
-) {
-	return glfw_context.handle
 }

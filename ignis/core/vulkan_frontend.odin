@@ -589,7 +589,6 @@ vk_color_blend_state_create :: proc(
 	return color_blend_state
 }
 
-// NOTE(Mitchell): Review reverse depth buffering
 vk_depth_stencil_state_create :: proc(
 	depth_test_enable:        b32                                     = true,
 	depth_write_enable:       b32                                     = true,
@@ -642,15 +641,6 @@ vk_dynamic_state_create :: proc(
 	}
 	
 	return dynamic_state
-}
-
-vk_swapchain_set_recreation_callback :: proc(
-	callback: proc(vk.Extent2D)
-) {
-	assert(vk_context.initialised)
-	assert(vk_context.swapchain.initialised)
-
-	append(&vk_context.swapchain.on_recreation, callback)
 }
 
 vk_image_find_supported_format :: proc(
@@ -1660,7 +1650,12 @@ vk_swapchain_get_extent :: proc() -> (
 	return vk_context.swapchain.attributes.extent
 }
 
-vk_command_image_barrier :: proc(
+vk_command_image_barrier :: proc{
+	vk_command_image_barrier_struct,
+	vk_command_image_barrier_handle,
+}
+
+vk_command_image_barrier_struct :: proc(
 	command_buffer:    VK_Command_Buffer,
 	image:             ^VK_Image,
 	src_access_mask:   vk.AccessFlags           = {},
@@ -1681,6 +1676,40 @@ vk_command_image_barrier :: proc(
 		oldLayout        = old_layout,
 		newLayout        = new_layout,
 		image            = image.handle,
+		subresourceRange = subresource_range
+	}
+
+	vk.CmdPipelineBarrier(
+		command_buffer.handle,
+		src_stage_mask,
+		dst_stage_mask,
+		{},
+		0, nil,
+		0, nil,
+		1, &barrier
+	)
+}
+
+vk_command_image_barrier_handle :: proc(
+	command_buffer:    VK_Command_Buffer,
+	handle:            vk.Image,
+	src_access_mask:   vk.AccessFlags           = {},
+	dst_access_mask:   vk.AccessFlags           = {},
+	old_layout:        vk.ImageLayout           = .UNDEFINED,
+	new_layout:        vk.ImageLayout           = .UNDEFINED,
+	subresource_range: vk.ImageSubresourceRange = {{.COLOR}, 0, 1, 0, 1},
+	src_stage_mask:    vk.PipelineStageFlags    = {.ALL_COMMANDS},
+	dst_stage_mask:    vk.PipelineStageFlags    = {.ALL_COMMANDS}
+) {
+	assert(vk_context.initialised)
+	
+	barrier: vk.ImageMemoryBarrier = {
+		sType            = .IMAGE_MEMORY_BARRIER,
+		dstAccessMask    = dst_access_mask,
+		srcAccessMask    = src_access_mask,
+		oldLayout        = old_layout,
+		newLayout        = new_layout,
+		image            = handle,
 		subresourceRange = subresource_range
 	}
 
@@ -1800,46 +1829,33 @@ vk_command_begin_rendering :: proc(
 	vk.CmdBeginRendering(command_buffer.handle, &rendering_info)
 }
 
-// NOTE(Mitchell): We don't support sparse binding so locations must be contiguous
-vk_vertex_description_create :: proc(
-	$Vertex:          typeid,
-	binding:          u32    = 0,
-	start_location:   u32    = 0,
-	allocator := context.allocator
+vk_vertex_input_descriptions_create :: proc(
+	$T:         typeid,
+	binding:    u32,
+	input_rate: vk.VertexInputRate,
+	locations:  [$Length]u32,
+	formats:    [Length]vk.Format
 ) -> (
 	binding_description:    vk.VertexInputBindingDescription,
-	attribute_descriptions: []vk.VertexInputAttributeDescription
+	attribute_descriptions: [Length]vk.VertexInputAttributeDescription
 ) {
-	context.allocator = allocator
-
+	field_count := reflect.struct_field_count(T)
+	assert(Length == field_count)
+	
 	binding_description = {
 		binding   = binding,
-		stride    = u32(type_info_of(Vertex).size),
-		inputRate = .VERTEX
+		stride    = u32(type_info_of(T).size),
+		inputRate = input_rate
 	}
-	
-	field_count := reflect.struct_field_count(Vertex)
-	attribute_descriptions = make([]vk.VertexInputAttributeDescription, field_count)
-	
-	for i in 0..<field_count {
-		field := reflect.struct_field_at(Vertex, i)
-		
-		attribute_descriptions[i] = {
-			location = start_location + u32(i),
-			binding  = binding,
-			offset   = u32(field.offset),
-		}
 
-		if field.type.size == 4 {
-			attribute_descriptions[i].format = .R32_SFLOAT
-		} else if field.type.size == 8 {
-			attribute_descriptions[i].format = .R32G32_SFLOAT
-		} else if field.type.size == 12 {
-			attribute_descriptions[i].format = .R32G32B32_SFLOAT
-		} else if field.type.size == 16 {
-			attribute_descriptions[i].format = .R32G32B32A32_SFLOAT
-		} else {
-			assert(false)
+	for i in 0..<field_count {
+		field := reflect.struct_field_at(T, i)
+
+		attribute_descriptions[i] = {
+			binding  = binding,
+			location = locations[i],
+			format   = formats[i],
+			offset   = u32(field.offset)
 		}
 	}
 
@@ -1928,77 +1944,25 @@ vk_buffer_destroy :: proc(
 	vk.DestroyBuffer(vk_context.device.logical, buffer.handle, nil)
 }
 
-vk_uniform_buffer_create :: proc(
-	size:         vk.DeviceSize,
-	vk_allocator: ^VK_Allocator,
-	memory_flags: vk.MemoryAllocateFlags = {},
-	sharing_mode: vk.SharingMode         = .EXCLUSIVE,
-	queues:       VK_Queue_Types         = {},
-	flags:        vk.BufferCreateFlags   = {}
-) -> (
-	uniform_buffer: VK_Buffer
-) {
-	assert(vk_allocator != nil)
-
-	uniform_buffer = vk_buffer_create(
-		size,
-		{.UNIFORM_BUFFER, .TRANSFER_DST},
-		.Always,
-		vk_allocator,
-		{.HOST_VISIBLE, .HOST_COHERENT},
-		memory_flags,
-		sharing_mode,
-		queues,
-		flags
-	)
-
-	return uniform_buffer
-}
-
-vk_storage_buffer_create :: proc(
-	size:         vk.DeviceSize,
-	vk_allocator: ^VK_Allocator,
-	memory_flags: vk.MemoryAllocateFlags = {},
-	sharing_mode: vk.SharingMode         = .EXCLUSIVE,
-	queues:       VK_Queue_Types         = {},
-	flags:        vk.BufferCreateFlags   = {}
-) -> (
-	storage_buffer: VK_Buffer
-) {
-	assert(vk_allocator != nil)
-
-	storage_buffer = vk_buffer_create(
-		size,
-		{.STORAGE_BUFFER, .TRANSFER_DST},
-		.Always,
-		vk_allocator,
-		{.HOST_VISIBLE, .HOST_COHERENT},
-		memory_flags,
-		sharing_mode,
-		queues,
-		flags
-	)
-
-	return storage_buffer
-}
-
-// NOTE(Mitchell): We may want to have {.DEVICE_LOCAL} be configurable i.e. {.HOST_VISIBLE, .HOST_COHERENT}
 vk_vertex_buffer_create :: proc(
-	size:         vk.DeviceSize,
-	vk_allocator: ^VK_Allocator,
-	memory_flags: vk.MemoryAllocateFlags = {},
-	sharing_mode: vk.SharingMode         = .EXCLUSIVE,
-	queues:       VK_Queue_Types         = {},
-	flags:        vk.BufferCreateFlags   = {}
+	size:           vk.DeviceSize,
+	vk_allocator:   ^VK_Allocator,
+	property_flags: vk.MemoryPropertyFlags = {.DEVICE_LOCAL},
+	memory_flags:   vk.MemoryAllocateFlags = {},
+	sharing_mode:   vk.SharingMode         = .EXCLUSIVE,
+	queues:         VK_Queue_Types         = {},
+	flags:          vk.BufferCreateFlags   = {}
 ) -> (
 	vertex_buffer: VK_Buffer
 ) {
+	assert(.DEVICE_LOCAL in property_flags || .HOST_VISIBLE in property_flags)
+	
 	vertex_buffer = vk_buffer_create(
 		size,
 		{.TRANSFER_DST, .VERTEX_BUFFER},
 		.Never,
 		vk_allocator,
-		{.DEVICE_LOCAL},
+		property_flags,
 		memory_flags,
 		sharing_mode,
 		queues,
@@ -2010,15 +1974,16 @@ vk_vertex_buffer_create :: proc(
 
 vk_command_vertex_buffers_bind :: #force_inline proc(
 	command_buffer: VK_Command_Buffer,
-	vertex_buffers: []vk.Buffer,
+	handles:        []vk.Buffer,
 	offsets:        []vk.DeviceSize = {0}
 ) {
-	vk.CmdBindVertexBuffers(command_buffer.handle, 0, u32(len(vertex_buffers)), raw_data(vertex_buffers), raw_data(offsets))
+	vk.CmdBindVertexBuffers(command_buffer.handle, 0, u32(len(handles)), raw_data(handles), raw_data(offsets))
 }
 
 vk_index_buffer_create :: proc(
 	size:         vk.DeviceSize,
 	vk_allocator: ^VK_Allocator,
+	property_flags: vk.MemoryPropertyFlags = {.DEVICE_LOCAL},
 	memory_flags: vk.MemoryAllocateFlags = {},
 	sharing_mode: vk.SharingMode         = .EXCLUSIVE,
 	queues:       VK_Queue_Types         = {},
@@ -2026,12 +1991,14 @@ vk_index_buffer_create :: proc(
 ) -> (
 	index_buffer: VK_Buffer
 ) {
+	assert(.DEVICE_LOCAL in property_flags || .HOST_VISIBLE in property_flags)
+	
 	index_buffer = vk_buffer_create(
 		size,
 		{.TRANSFER_DST, .INDEX_BUFFER},
 		.Never,
 		vk_allocator,
-		{.DEVICE_LOCAL},
+		property_flags,
 		memory_flags,
 		sharing_mode,
 		queues,
@@ -2043,21 +2010,13 @@ vk_index_buffer_create :: proc(
 
 vk_command_index_buffer_bind :: #force_inline proc(
 	command_buffer: VK_Command_Buffer,
-	index_buffer:   vk.Buffer,
+	handle:         vk.Buffer,
 	index_type:     vk.IndexType  = .UINT32,
 	offset:         vk.DeviceSize = 0,
 ) {
-	vk.CmdBindIndexBuffer(command_buffer.handle, index_buffer, offset, index_type)
+	vk.CmdBindIndexBuffer(command_buffer.handle, handle, offset, index_type)
 }
 
-vk_buffer_copy :: proc {
-	vk_buffer_copy_buffer,
-	vk_buffer_copy_staged,
-	vk_buffer_copy_mapped,
-}
-
-// TODO(Mitchell): Improve abstraction
-// NOTE(Mitchell): Command pool must be created with transfer queue support
 vk_buffer_copy_buffer :: proc(
 	command_pool: VK_Command_Pool,
 	src_buffer:   ^VK_Buffer,
@@ -2078,8 +2037,6 @@ vk_buffer_copy_buffer :: proc(
 	vk_command_buffer_end_single(command_buffer)
 }
 
-// TODO(Mitchell): Improve abstraction
-// NOTE(Mitchell): Command pool must be created with transfer queue support
 vk_buffer_copy_staged :: proc(
 	command_pool: VK_Command_Pool,
 	buffer:       ^VK_Buffer,
@@ -2137,17 +2094,13 @@ vk_buffer_copy_mapped :: proc(
 	}
 }
 
-vk_image_copy :: proc {
-	vk_image_copy_buffer,
-	vk_image_copy_staged,
-}
-
 vk_image_copy_buffer :: proc(
 	command_pool:       VK_Command_Pool,
 	image:              ^VK_Image,
 	buffer:             ^VK_Buffer,
 	subresource_layers: vk.ImageSubresourceLayers = {{.COLOR}, 0, 0, 1}
 ) {
+	assert(vk_context.initialised)
 	assert(image != nil)
 	assert(buffer != nil)
 
